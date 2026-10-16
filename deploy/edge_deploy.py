@@ -3,10 +3,10 @@
 registry and rolls back on any failure.
 
 Runs as root through one restricted SSH account. Each owner's runner user has its own key, whose forced command
-fixes the owner:   command="sudo -n /usr/local/sbin/edge-deploy <owner>"
+fixes the owner:   command="sudo -n /usr/local/sbin/edge-app-deploy <owner>"
 The CI sends:     deploy <app> <40-hex commit> <component>=sha256:<64 hex> [...]
 so a job can only deploy apps whose configuration names its owner, and only the exact image contents (digests)
-it built and scanned. Every app is described by /etc/edge-deploy/apps/<app>.json (root-owned, see README).
+it built and scanned. Every app is described by /etc/edge-app-deploy/apps/<app>.json (root-owned, see README).
 
 The containers keep their whole runtime configuration (environment, mounts, ports, networks, limits); only the
 image changes. Before anything stops, every container and image is checked; afterwards the app must turn healthy
@@ -30,8 +30,8 @@ from urllib.parse import quote, urlencode
 from urllib.request import urlopen
 import uuid
 
-CONFIG_DIR = Path('/etc/edge-deploy/apps')
-STATE_DIR = Path('/var/lib/edge-deploy')
+CONFIG_DIR = Path('/etc/edge-app-deploy/apps')
+STATE_DIR = Path('/var/lib/edge-app-deploy')
 REGISTRY = '127.0.0.1:5000'
 REVISION = 'org.opencontainers.image.revision'
 TRANSACTION = 'io.edge.deploy-transaction'
@@ -140,7 +140,7 @@ class Engine:
 
 
 def image_tag(app, component, sha):
-    return f'edge-deploy/{app}-{component}:{sha}'
+    return f'edge-app-deploy/{app}-{component}:{sha}'
 
 
 def pull(app, sha, digests, config, run=subprocess.run):
@@ -323,7 +323,7 @@ def main():
         signal.signal(number, interrupted)
     os.umask(0o077)
     STATE_DIR.mkdir(mode=0o700, exist_ok=True)
-    descriptor = os.open(f'/run/lock/edge-deploy-{app}.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+    descriptor = os.open(f'/run/lock/edge-app-deploy-{app}.lock', os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     with os.fdopen(descriptor, 'a') as lock:
         require(os.fstat(lock.fileno()).st_uid == 0, 'Unsafe deployment lock')
         fcntl.flock(lock, fcntl.LOCK_EX)

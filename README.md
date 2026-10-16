@@ -79,7 +79,7 @@ networks, limits), waits for health and rolls every container back on failure.
       components: '[{"name": "web", "context": ".", "file": "Dockerfile"}]'
 ```
 
-Each app is described once on the VPS, root-owned, in `/etc/edge-deploy/apps/<app>.json`:
+Each app is described once on the VPS, root-owned, in `/etc/edge-app-deploy/apps/<app>.json`:
 
 ```json
 {

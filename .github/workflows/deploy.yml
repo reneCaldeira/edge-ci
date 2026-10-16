@@ -1,7 +1,7 @@
 name: Edge deploy
 
 # Reusable workflow: build an app's images on the Edge VPS runner, scan them, push them to the local registry and
-# hand them to the edge-deploy helper, which replaces the app's containers and rolls back on failure.
+# hand them to the edge-app-deploy helper, which replaces the app's containers and rolls back on failure.
 #
 #   deploy:
 #     needs: [tests, quality]
@@ -11,14 +11,14 @@ name: Edge deploy
 #       app: contratos
 #       components: '[{"name": "web", "context": ".", "file": "Dockerfile"}]'
 #
-# The app must be described in /etc/edge-deploy/apps/<app>.json on the VPS (see README): owner, the container
+# The app must be described in /etc/edge-app-deploy/apps/<app>.json on the VPS (see README): owner, the container
 # of every component and its registry repository "<owner>/<app>-<component>". Nothing is pushed to GitHub.
 
 on:
   workflow_call:
     inputs:
       app:
-        description: "App name, as in /etc/edge-deploy/apps/<app>.json"
+        description: "App name, as in /etc/edge-app-deploy/apps/<app>.json"
         type: string
         required: true
       components:
@@ -34,7 +34,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: edge-deploy-${{ inputs.app }}
+  group: edge-app-deploy-${{ inputs.app }}
   cancel-in-progress: false
 
 jobs:
@@ -107,9 +107,9 @@ jobs:
             digests="${digests} ${name}=$(cat "${RUNNER_TEMP}/${name}.digest")"
           done
           # each runner user has its own key; the helper's forced command fixes the owner allowed to deploy
-          ssh -T -i "${HOME}/.ssh/edge-deploy" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=15 \
-            -o StrictHostKeyChecking=yes -o UserKnownHostsFile="${HOME}/.ssh/known_hosts_edge_deploy" \
-            edge-deploy@127.0.0.1 "deploy ${APP} ${GITHUB_SHA}${digests}" < /dev/null
+          ssh -T -i "${HOME}/.ssh/edge-app-deploy" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=15 \
+            -o StrictHostKeyChecking=yes -o UserKnownHostsFile="${HOME}/.ssh/known_hosts_edge_app_deploy" \
+            edge-app-deploy@127.0.0.1 "deploy ${APP} ${GITHUB_SHA}${digests}" < /dev/null
 
       - name: Remove the build images from the runner
         if: always()
