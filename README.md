@@ -5,10 +5,6 @@ itself and judges **new code** only, the way Sonar's "Sonar way" quality gate do
 
 ## Use it
 
-New repository on the Edge VPS? Start with [docs/primeira-pipeline.md](docs/primeira-pipeline.md): a step-by-step
-guide (in Portuguese) from enabling the repository in Snorlx to
-the first deployment.
-
 Add one job to the repository's workflow (main pushes; pull requests stay light):
 
 ```yaml
