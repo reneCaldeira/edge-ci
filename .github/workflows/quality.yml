@@ -1,0 +1,209 @@
+name: Edge quality scan
+
+# Reusable workflow: the scans that replaced SonarQube on the shared Edge VPS runners. A caller adds one job:
+#
+#   quality:
+#     if: github.event_name != 'pull_request'
+#     uses: reneCaldeira/edge-ci/.github/workflows/quality.yml@main
+#
+# It detects the repository's languages and runs only what applies, on new code (the diff from the previous
+# commit of the branch): OpenGrep with pinned community rules, ruff, shellcheck, hadolint, actionlint,
+# PSScriptAnalyzer, sqlfluff, jscpd and Trivy. Blocking: new OpenGrep findings of severity ERROR and HIGH
+# confidence, more than 10% duplicated lines in the changed files, Trivy CRITICAL/HIGH. Everything else is
+# reported in the run summary. Results are also left in ~/.cache/quality/<repo>/<run id>/ for a deployment gate
+# (quality/gate.py) in a later job of the same run.
+#
+# Runs only on the Edge VPS runners: the scanners and tools live there (/opt/bin, /opt/edge-actions/tools).
+
+on:
+  workflow_call:
+    inputs:
+      exclude:
+        description: "Extra paths or globs to leave out of every scan, space separated"
+        type: string
+        default: ""
+      sql-dialect:
+        description: "sqlfluff dialect for .sql files"
+        type: string
+        default: "postgres"
+      edge-ci-ref:
+        description: "Ref of reneCaldeira/edge-ci whose scripts and rule pins are used"
+        type: string
+        default: "main"
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    name: Quality scan
+    runs-on: [self-hosted, linux, x64, edge-vps]
+    timeout-minutes: 30
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          filter: blob:none
+
+      - name: Checkout the shared scan scripts
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: reneCaldeira/edge-ci
+          ref: ${{ inputs.edge-ci-ref }}
+          path: .edge-ci
+          persist-credentials: false
+
+      - name: New code and languages
+        id: detect
+        env:
+          BEFORE: ${{ github.event.before }}
+        run: |
+          set -euo pipefail
+          run_dir="${HOME}/.cache/quality/${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}"
+          mkdir -p "${run_dir}"
+          echo "QUALITY_RUN_DIR=${run_dir}" >> "$GITHUB_ENV"
+          reference="${HOME}/.cache/quality/${GITHUB_REPOSITORY}/baseline.json"
+          if [ -z "${BEFORE}" ] && [ -f "${reference}" ]; then
+            # manual runs carry no previous commit: compare with the last deployment that passed the gate
+            BEFORE="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("sha",""))' "${reference}")"
+          fi
+          if [ -n "${BEFORE}" ] && [ "${BEFORE}" != "0000000000000000000000000000000000000000" ] \
+             && git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
+            git diff --name-only --diff-filter=ACMR "${BEFORE}" HEAD > "${RUNNER_TEMP}/changed-files.txt"
+            echo "QUALITY_BASELINE=${BEFORE}" >> "$GITHUB_ENV"
+          else
+            git ls-files > "${RUNNER_TEMP}/changed-files.txt"
+          fi
+          echo "$(wc -l < "${RUNNER_TEMP}/changed-files.txt") changed files"
+          has() { git ls-files "$@" | grep -q . && echo true || echo false; }
+          {
+            echo "python=$(has '*.py')"
+            echo "shell=$(has '*.sh' '*.bash')"
+            echo "powershell=$(has '*.ps1' '*.psm1')"
+            echo "sql=$(has '*.sql')"
+            echo "docker=$(has '*Dockerfile*')"
+            echo "workflows=$(has '.github/workflows/*.yml' '.github/workflows/*.yaml')"
+          } | tee -a "$GITHUB_OUTPUT"
+          {
+            echo "## Edge quality scan"
+            echo ""
+            echo "- New code: $(wc -l < "${RUNNER_TEMP}/changed-files.txt") files$([ -n "${QUALITY_BASELINE:-}" ] || echo ' (no previous commit: whole repository)')"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: OpenGrep on new code
+        env:
+          EXTRA_EXCLUDE: ${{ inputs.exclude }}
+        run: |
+          set -euo pipefail
+          rules="$(python3 .edge-ci/opengrep/collect_rules.py "${HOME}/.cache/opengrep-rules")"
+          args=()
+          had=false
+          if [ -n "${QUALITY_BASELINE:-}" ]; then args+=(--baseline-commit "${QUALITY_BASELINE}"); had=true; fi
+          for x in node_modules dist build coverage .venv venv vendor .edge-ci '*.go' go.sum '*.lock' pnpm-lock.yaml \
+                   package-lock.json '*.min.js' '*.map' '*.png' '*.jpg' '*.jpeg' '*.gif' '*.svg' '*.ico' '*.woff' '*.woff2' \
+                   '*.pdf' '*.mp4' '*.liquid' ${EXTRA_EXCLUDE}; do
+            args+=(--exclude "$x")
+          done
+          /opt/bin/opengrep scan --jobs 4 --timeout 60 --config "${rules}" "${args[@]}" --json-output "${RUNNER_TEMP}/opengrep.json" . > /dev/null
+          python3 .edge-ci/quality/opengrep_new.py "${RUNNER_TEMP}/opengrep.json" "${QUALITY_RUN_DIR}" "${had}"
+          python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("- OpenGrep: %d new findings, %d blocking" % (d["new"], len(d["blocking"])))' \
+            "${QUALITY_RUN_DIR}/opengrep.json" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Linters for the languages present (report only)
+        env:
+          PYTHON: ${{ steps.detect.outputs.python }}
+          SHELL_SCRIPTS: ${{ steps.detect.outputs.shell }}
+          POWERSHELL: ${{ steps.detect.outputs.powershell }}
+          SQL: ${{ steps.detect.outputs.sql }}
+          DOCKER: ${{ steps.detect.outputs.docker }}
+          WORKFLOWS: ${{ steps.detect.outputs.workflows }}
+          SQL_DIALECT: ${{ inputs.sql-dialect }}
+        run: |
+          set -uo pipefail
+          T=/opt/edge-actions/tools
+          tools="${HOME}/.cache/edge-tools"
+          mkdir -p "${tools}"
+          fetch() {  # name url sha256 [archive member]
+            local name="$1" url="$2" sum="$3" member="${4:-}" bin="${tools}/$1"
+            [ -x "${bin}" ] && return 0
+            local tmp; tmp="$(mktemp)"
+            curl -fsSL -o "${tmp}" "${url}" && echo "${sum}  ${tmp}" | sha256sum -c - >/dev/null || { rm -f "${tmp}"; return 1; }
+            if [ -n "${member}" ]; then tar -xf "${tmp}" -O "${member}" > "${bin}"; else cp "${tmp}" "${bin}"; fi
+            rm -f "${tmp}"; chmod +x "${bin}"
+          }
+          report() { echo "- $1: $2" >> "$GITHUB_STEP_SUMMARY"; }
+          if [ "${PYTHON}" = true ]; then
+            echo "::group::ruff"
+            # the repository's own ruff configuration wins; otherwise a broad Sonar-like default
+            if [ -f ruff.toml ] || [ -f .ruff.toml ] || { [ -f pyproject.toml ] && grep -q '^\[tool\.ruff' pyproject.toml; }; then
+              sel=()
+            else
+              sel=(--select E,F,W,B,C90,SIM,PL,S,UP,RUF --ignore E501)
+            fi
+            n=$("${T}/bin/ruff" check --exit-zero --output-format concise "${sel[@]}" . 2>&1 | tee /dev/stderr | grep -cE '^[^ ].*:[0-9]+:[0-9]+:' || true)
+            echo "::endgroup::"; report ruff "${n} findings"
+          fi
+          if [ "${SHELL_SCRIPTS}" = true ] || [ "${WORKFLOWS}" = true ]; then
+            fetch shellcheck https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.gz \
+              b7af85e41cc99489dcc21d66c6d5f3685138f06d34651e6d34b42ec6d54fe6f6 shellcheck-v0.11.0/shellcheck
+          fi
+          if [ "${SHELL_SCRIPTS}" = true ]; then
+            echo "::group::shellcheck"
+            mapfile -t scripts < <(git ls-files '*.sh' '*.bash')
+            n=$("${tools}/shellcheck" -f gcc "${scripts[@]}" 2>&1 | tee /dev/stderr | grep -c ': \(warning\|error\|note\|style\):' || true)
+            echo "::endgroup::"; report shellcheck "${n} findings in ${#scripts[@]} scripts"
+          fi
+          if [ "${DOCKER}" = true ]; then
+            fetch hadolint https://github.com/hadolint/hadolint/releases/download/v2.15.1/hadolint-linux-x86_64 \
+              c7187db94eeeeca956519a6af171adc31453941a1e777961f6e680f697c8c507
+            echo "::group::hadolint"
+            mapfile -t dockerfiles < <(git ls-files '*Dockerfile*')
+            n=$("${tools}/hadolint" --no-fail "${dockerfiles[@]}" | tee /dev/stderr | grep -c ' DL\| SC' || true)
+            echo "::endgroup::"; report hadolint "${n} findings in ${#dockerfiles[@]} Dockerfiles"
+          fi
+          if [ "${WORKFLOWS}" = true ]; then
+            fetch actionlint https://github.com/rhysd/actionlint/releases/download/v1.7.12/actionlint_1.7.12_linux_amd64.tar.gz \
+              8aca8db96f1b94770f1b0d72b6dddcb1ebb8123cb3712530b08cc387b349a3d8 actionlint
+            echo "::group::actionlint"
+            n=$(SHELLCHECK_OPTS="" "${tools}/actionlint" -shellcheck "${tools}/shellcheck" -no-color 2>&1 | tee /dev/stderr | grep -c '^\.github/' || true)
+            echo "::endgroup::"; report actionlint "${n} findings"
+          fi
+          if [ "${POWERSHELL}" = true ]; then
+            echo "::group::PSScriptAnalyzer"
+            n=$(HOME="${RUNNER_TEMP}" POWERSHELL_TELEMETRY_OPTOUT=1 "${T}/bin/pwsh" -NoProfile -NonInteractive -Command \
+              "Import-Module ${T}/pwsh-modules/PSScriptAnalyzer/1.9.0/PSScriptAnalyzer.psd1; \$r = Invoke-ScriptAnalyzer -Path . -Recurse; \$r | Format-Table -AutoSize | Out-String -Width 200 | Write-Host; \$r.Count" 2>&1 | tail -1)
+            echo "::endgroup::"; report PSScriptAnalyzer "${n} findings"
+          fi
+          if [ "${SQL}" = true ]; then
+            echo "::group::sqlfluff"
+            mapfile -t sql < <(git ls-files '*.sql')
+            n=$("${T}/bin/sqlfluff" lint --dialect "${SQL_DIALECT}" --format github-annotation-native --nofail "${sql[@]}" 2>&1 | tee /dev/stderr | grep -c '^::' || true)
+            echo "::endgroup::"; report sqlfluff "${n} findings in ${#sql[@]} files (${SQL_DIALECT})"
+          fi
+          echo "::group::jscpd"
+          export PATH="${T}/node-26.12.0/bin:${T}/pnpm-12.11.2/bin:${PATH}"
+          FORCE_COLOR=0 NO_COLOR=1 pnpm dlx jscpd@5.4.1 --silent --reporters console,json --output "${RUNNER_TEMP}/jscpd" \
+            --ignore '**/node_modules/**,**/dist/**,**/build/**,**/coverage/**,**/.venv/**,**/vendor/**,**/.edge-ci/**,**/*.json,**/*.lock,**/pnpm-lock.yaml,**/*.min.js' \
+            . 2>&1 | tee "${RUNNER_TEMP}/jscpd.txt" || true
+          echo "::endgroup::"
+          python3 .edge-ci/quality/duplication.py "${RUNNER_TEMP}/jscpd/jscpd-report.json" "${RUNNER_TEMP}/changed-files.txt" "${QUALITY_RUN_DIR}" || true
+          report jscpd "$(grep -iE 'duplicat' "${RUNNER_TEMP}/jscpd.txt" | tail -1 || echo 'see log')"
+
+      - name: Refresh the shared Trivy database (at most once a day)
+        run: |
+          set -euo pipefail
+          mkdir -p "${HOME}/.cache/trivy"
+          # one updater at a time; the others wait and then reuse the same database
+          flock "${HOME}/.cache/trivy.lock" /opt/bin/trivy image --download-db-only --cache-dir "${HOME}/.cache/trivy" --quiet
+
+      - name: Trivy on the repository (CRITICAL/HIGH block)
+        run: |
+          /opt/bin/trivy fs --cache-dir "${HOME}/.cache/trivy" --skip-db-update --cache-backend memory \
+            --skip-dirs .edge-ci --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1 .
+
+      - name: Scan verdict (new OpenGrep findings, duplication)
+        run: |
+          # coverage and per-language bugs come from the caller's own test jobs and are judged by its deploy gate
+          python3 .edge-ci/quality/gate.py check "${QUALITY_RUN_DIR}" "${HOME}/.cache/quality/${GITHUB_REPOSITORY}/baseline.json"
