@@ -1,0 +1,118 @@
+name: Edge deploy
+
+# Reusable workflow: build an app's images on the Edge VPS runner, scan them, push them to the local registry and
+# hand them to the edge-deploy helper, which replaces the app's containers and rolls back on failure.
+#
+#   deploy:
+#     needs: [tests, quality]
+#     if: github.ref == 'refs/heads/main' && github.event_name != 'pull_request'
+#     uses: reneCaldeira/edge-ci/.github/workflows/deploy.yml@main
+#     with:
+#       app: contratos
+#       components: '[{"name": "web", "context": ".", "file": "Dockerfile"}]'
+#
+# The app must be described in /etc/edge-deploy/apps/<app>.json on the VPS (see README): owner, the container
+# of every component and its registry repository "<owner>/<app>-<component>". Nothing is pushed to GitHub.
+
+on:
+  workflow_call:
+    inputs:
+      app:
+        description: "App name, as in /etc/edge-deploy/apps/<app>.json"
+        type: string
+        required: true
+      components:
+        description: 'JSON list: [{"name", "context", "file", "build-args": "K=V K2=V2"}]'
+        type: string
+        required: true
+      scan:
+        description: "Scan the images with Trivy before deploying (CRITICAL/HIGH block)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: edge-deploy-${{ inputs.app }}
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: Build and deploy ${{ inputs.app }}
+    runs-on: [self-hosted, linux, x64, edge-vps]
+    timeout-minutes: 60
+    env:
+      APP: ${{ inputs.app }}
+      COMPONENTS: ${{ inputs.components }}
+    steps:
+      - name: Checkout the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build the images
+        run: |
+          set -euo pipefail
+          [[ "${APP}" =~ ^[a-z0-9][a-z0-9_.-]{0,62}$ ]] || { echo "::error::invalid app name"; exit 1; }
+          python3 - <<'PY'
+          import json, os, re, shlex, subprocess
+          app, sha = os.environ["APP"], os.environ["GITHUB_SHA"]
+          components = json.loads(os.environ["COMPONENTS"])
+          assert isinstance(components, list) and components, "components must be a non-empty JSON list"
+          for c in components:
+              name = c["name"]
+              assert re.fullmatch(r"[a-z0-9][a-z0-9_.-]{0,62}", name), f"invalid component name {name!r}"
+              argv = ["docker", "build", "--file", c.get("file", "Dockerfile"),
+                      "--label", f"org.opencontainers.image.revision={sha}",
+                      "--label", f"org.opencontainers.image.source={os.environ['GITHUB_SERVER_URL']}/{os.environ['GITHUB_REPOSITORY']}",
+                      "--tag", f"edge-build/{app}-{name}:{sha}"]
+              for arg in shlex.split(c.get("build-args", "")):
+                  argv += ["--build-arg", arg]
+              argv.append(c.get("context", "."))
+              print("::group::" + name, flush=True)
+              subprocess.run(argv, check=True)  # one after the other: parallel builds overload the shared VPS
+              print("::endgroup::", flush=True)
+          PY
+
+      - name: Refresh the shared Trivy database (at most once a day)
+        if: inputs.scan
+        run: |
+          set -euo pipefail
+          mkdir -p "${HOME}/.cache/trivy"
+          flock "${HOME}/.cache/trivy.lock" /opt/bin/trivy image --download-db-only --cache-dir "${HOME}/.cache/trivy" --quiet
+
+      - name: Scan the images (Trivy, CRITICAL/HIGH block the deployment)
+        if: inputs.scan
+        run: |
+          set -euo pipefail
+          for name in $(python3 -c 'import json,os; print(" ".join(c["name"] for c in json.loads(os.environ["COMPONENTS"])))'); do
+            echo "::group::${name}"
+            /opt/bin/trivy image --cache-dir "${HOME}/.cache/trivy" --skip-db-update --cache-backend memory \
+              --severity CRITICAL,HIGH --ignore-unfixed --exit-code 1 "edge-build/${APP}-${name}:${GITHUB_SHA}"
+            echo "::endgroup::"
+          done
+
+      - name: Push to the local registry and deploy
+        run: |
+          set -euo pipefail
+          owner="$(echo "${GITHUB_REPOSITORY_OWNER}" | tr '[:upper:]' '[:lower:]')"
+          digests=""
+          for name in $(python3 -c 'import json,os; print(" ".join(c["name"] for c in json.loads(os.environ["COMPONENTS"])))'); do
+            # skopeo runs on the host network: the rootless Docker cannot reach the host's 127.0.0.1
+            skopeo copy --quiet --src-daemon-host "${DOCKER_HOST}" --dest-tls-verify=false \
+              --digestfile "${RUNNER_TEMP}/${name}.digest" \
+              "docker-daemon:edge-build/${APP}-${name}:${GITHUB_SHA}" \
+              "docker://127.0.0.1:5000/${owner}/${APP}-${name}:${GITHUB_SHA}"
+            digests="${digests} ${name}=$(cat "${RUNNER_TEMP}/${name}.digest")"
+          done
+          # each runner user has its own key; the helper's forced command fixes the owner allowed to deploy
+          ssh -T -i "${HOME}/.ssh/edge-deploy" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=15 \
+            -o StrictHostKeyChecking=yes -o UserKnownHostsFile="${HOME}/.ssh/known_hosts_edge_deploy" \
+            edge-deploy@127.0.0.1 "deploy ${APP} ${GITHUB_SHA}${digests}" < /dev/null
+
+      - name: Remove the build images from the runner
+        if: always()
+        run: |
+          docker image ls -q --filter "reference=edge-build/${APP}-*" | xargs -r docker image rm -f >/dev/null 2>&1 || true
+          docker image prune -f >/dev/null 2>&1 || true

@@ -1,0 +1,22 @@
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Unit tests
+        run: |
+          (cd deploy && python3 -m unittest -v test_edge_deploy)
+          python3 -m py_compile quality/*.py opengrep/*.py deploy/*.py
+          bash -n deploy/install.sh
