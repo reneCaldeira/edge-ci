@@ -72,6 +72,7 @@ jobs:
           if [ -n "${BEFORE}" ] && [ "${BEFORE}" != "0000000000000000000000000000000000000000" ] \
              && git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
             git diff --name-only --diff-filter=ACMR "${BEFORE}" HEAD > "${RUNNER_TEMP}/changed-files.txt"
+            git diff -U0 --no-color --diff-filter=ACMR "${BEFORE}" HEAD > "${RUNNER_TEMP}/changed-lines.diff"
             echo "QUALITY_BASELINE=${BEFORE}" >> "$GITHUB_ENV"
           else
             git ls-files > "${RUNNER_TEMP}/changed-files.txt"
@@ -188,7 +189,9 @@ jobs:
             --ignore '**/node_modules/**,**/dist/**,**/build/**,**/coverage/**,**/.venv/**,**/vendor/**,**/.edge-ci/**,**/*.json,**/*.lock,**/pnpm-lock.yaml,**/*.min.js' \
             . 2>&1 | tee "${RUNNER_TEMP}/jscpd.txt" || true
           echo "::endgroup::"
-          python3 .edge-ci/quality/duplication.py "${RUNNER_TEMP}/jscpd/jscpd-report.json" "${RUNNER_TEMP}/changed-files.txt" "${QUALITY_RUN_DIR}" || true
+          # with a previous commit only the lines it added count (changed-lines.diff); otherwise whole files
+          python3 .edge-ci/quality/duplication.py "${RUNNER_TEMP}/jscpd/jscpd-report.json" "${RUNNER_TEMP}/changed-files.txt" "${QUALITY_RUN_DIR}" \
+            $([ -f "${RUNNER_TEMP}/changed-lines.diff" ] && echo "${RUNNER_TEMP}/changed-lines.diff") || true
           report jscpd "$(grep -iE 'duplicat' "${RUNNER_TEMP}/jscpd.txt" | tail -1 || echo 'see log')"
 
       - name: Refresh the shared Trivy database (at most once a day)
