@@ -44,8 +44,9 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # full history with file contents: the new-lines diff needs the previous commit's blobs, and a
+          # blob-less clone cannot fetch them later without credentials
           fetch-depth: 0
-          filter: blob:none
 
       - name: Checkout the shared scan scripts
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -72,7 +73,7 @@ jobs:
           if [ -n "${BEFORE}" ] && [ "${BEFORE}" != "0000000000000000000000000000000000000000" ] \
              && git cat-file -e "${BEFORE}^{commit}" 2>/dev/null; then
             git diff --name-only --diff-filter=ACMR "${BEFORE}" HEAD > "${RUNNER_TEMP}/changed-files.txt"
-            git diff -U0 --no-color --diff-filter=ACMR "${BEFORE}" HEAD > "${RUNNER_TEMP}/changed-lines.diff"
+            git diff -U0 --no-color --diff-filter=ACMR "${BEFORE}" HEAD > "${RUNNER_TEMP}/changed-lines.diff"               || rm -f "${RUNNER_TEMP}/changed-lines.diff"  # without it duplication falls back to whole files
             echo "QUALITY_BASELINE=${BEFORE}" >> "$GITHUB_ENV"
           else
             git ls-files > "${RUNNER_TEMP}/changed-files.txt"
