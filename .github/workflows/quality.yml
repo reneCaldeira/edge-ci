@@ -3,11 +3,10 @@ name: Edge quality scan
 # Reusable workflow: the scans that replaced SonarQube on the shared Edge VPS runners. A caller adds one job:
 #
 #   quality:
-#     if: github.event_name != 'pull_request'
 #     uses: reneCaldeira/edge-ci/.github/workflows/quality.yml@main
 #
 # It detects the repository's languages and runs only what applies, on new code (the diff from the previous
-# commit of the branch): OpenGrep with pinned community rules, ruff, shellcheck, hadolint, actionlint,
+# commit of the branch, or from the base branch on a pull request): OpenGrep with pinned community rules, ruff, shellcheck, hadolint, actionlint,
 # PSScriptAnalyzer, sqlfluff, jscpd and Trivy. Blocking: new OpenGrep findings of severity ERROR and HIGH
 # confidence, more than 10% duplicated lines in the changed files, Trivy CRITICAL/HIGH. Everything else is
 # reported in the run summary. Results are also left in ~/.cache/quality/<repo>/<run id>/ for a deployment gate
@@ -59,7 +58,7 @@ jobs:
       - name: New code and languages
         id: detect
         env:
-          BEFORE: ${{ github.event.before }}
+          BEFORE: ${{ github.event.pull_request.base.sha || github.event.before }}
         run: |
           set -euo pipefail
           run_dir="${HOME}/.cache/quality/${GITHUB_REPOSITORY}/${GITHUB_RUN_ID}"
