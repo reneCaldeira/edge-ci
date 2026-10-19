@@ -39,6 +39,16 @@ jobs:
     runs-on: [self-hosted, linux, x64, edge-vps]
     timeout-minutes: 30
     steps:
+      # The runner slots keep their workspaces, and actions/checkout reuses the repository it finds there. One
+      # checked out while this job still used `filter: blob:none` stays a partial clone after any later fetch, so
+      # the baseline's blobs are missing and, with the credentials gone, OpenGrep's --baseline-commit exits 2.
+      - name: Drop a leftover partial clone
+        run: |
+          if [ "$(git -C "${GITHUB_WORKSPACE}" config --local --get remote.origin.promisor 2>/dev/null)" = "true" ]; then
+            echo "Partial clone left in ${GITHUB_WORKSPACE}: removing it so the checkout below makes a full one"
+            find "${GITHUB_WORKSPACE}" -mindepth 1 -maxdepth 1 -exec rm -rf {} +
+          fi
+
       - name: Checkout the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -107,7 +117,12 @@ jobs:
                    '*.pdf' '*.mp4' '*.liquid' ${EXTRA_EXCLUDE}; do
             args+=(--exclude "$x")
           done
-          /opt/bin/opengrep scan --jobs 4 --timeout 60 --config "${rules}" "${args[@]}" --json-output "${RUNNER_TEMP}/opengrep.json" . > /dev/null
+          /opt/bin/opengrep scan --jobs 4 --timeout 60 --config "${rules}" "${args[@]}" --json-output "${RUNNER_TEMP}/opengrep.json" . > /dev/null \
+            || { rc=$?
+                 # the reason is only in the report: print its errors, not just the exit code
+                 python3 -c 'import json,sys; [print("::error::OpenGrep: " + e.get("message", "").strip().replace("%", "%25").replace("\n", "%0A")) for e in json.load(open(sys.argv[1])).get("errors", []) if e.get("level") == "error"]' \
+                   "${RUNNER_TEMP}/opengrep.json" || true
+                 exit "${rc}"; }
           python3 .edge-ci/quality/opengrep_new.py "${RUNNER_TEMP}/opengrep.json" "${QUALITY_RUN_DIR}" "${had}"
           python3 -c 'import json,sys; d=json.load(open(sys.argv[1])); print("- OpenGrep: %d new findings, %d blocking" % (d["new"], len(d["blocking"])))' \
             "${QUALITY_RUN_DIR}/opengrep.json" >> "$GITHUB_STEP_SUMMARY"
