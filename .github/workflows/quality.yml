@@ -12,7 +12,7 @@ name: Edge quality scan
 # reported in the run summary. Results are also left in ~/.cache/quality/<repo>/<run id>/ for a deployment gate
 # (quality/gate.py) in a later job of the same run.
 #
-# Runs only on the Edge VPS runners: the scanners and tools live there (/opt/bin, /opt/edge-actions/tools).
+# Runs on a selected self-hosted pool: scanners and tools live at /opt/bin and /opt/edge-actions/tools.
 
 on:
   workflow_call:
@@ -29,6 +29,10 @@ on:
         description: "Ref of reneCaldeira/edge-ci whose scripts and rule pins are used"
         type: string
         default: "main"
+      auronico_shared:
+        description: "Run this job on the Auronico Shared runner pool"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -36,7 +40,7 @@ permissions:
 jobs:
   scan:
     name: Quality scan
-    runs-on: [self-hosted, linux, x64, edge-vps]
+    runs-on: ${{ inputs.auronico_shared && fromJSON('["self-hosted","linux","x64","auronico-shared"]') || fromJSON('["self-hosted","linux","x64","edge-vps"]') }}
     timeout-minutes: 30
     steps:
       # The runner slots keep their workspaces, and actions/checkout reuses the repository it finds there. One
