@@ -1,7 +1,7 @@
 # edge-ci
 
-Shared CI for repositories built on the Edge VPS runners. It replaces SonarQube with scanners that run on the VPS
-itself and judges **new code** only, the way Sonar's "Sonar way" quality gate does.
+Shared CI for repositories built on the Auronico Shared runners. It replaces SonarQube with scanners that run in
+the shared pipeline environment and judges **new code** only, the way Sonar's "Sonar way" quality gate does.
 
 ## Use it
 
@@ -12,13 +12,13 @@ jobs:
   quality:
     if: github.event_name != 'pull_request'
     uses: reneCaldeira/edge-ci/.github/workflows/quality.yml@main
-    # with:
-    #   exclude: "legacy/ generated/"   # extra paths or globs to skip
-    #   sql-dialect: postgres            # for .sql files
+    with:
+      auronico_shared: true
+      # exclude: "legacy/ generated/"   # extra paths or globs to skip
+      # sql-dialect: postgres            # for .sql files
 ```
 
-The job runs only on the Edge VPS runner pool (`self-hosted, linux, x64, edge-vps`); enable the repository in
-Snorlx first.
+The quality scan runs on the Auronico Shared pool (`self-hosted, linux, x64, auronico-shared`).
 
 ## What runs
 
